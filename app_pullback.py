@@ -1,6 +1,12 @@
 from flask import Flask, request, jsonify, render_template_string
 import requests
 import concurrent.futures
+import os
+import json
+import re
+import subprocess
+import threading
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -241,6 +247,38 @@ HTML_TEMPLATE = """
         .toast-error { color: #fca5a5; background: rgba(127, 29, 29, 0.85); border-color: rgba(239, 68, 68, 0.4); }
         .toast-success { color: #86efac; background: rgba(20, 83, 45, 0.85); border-color: rgba(34, 197, 94, 0.4); }
         .toast-info { color: #7dd3fc; background: rgba(12, 74, 110, 0.85); border-color: rgba(6, 182, 212, 0.4); }
+        /* ===== 财务报告弹窗 ===== */
+        .modal-mask {
+            position: fixed; inset: 0; z-index: 60;
+            background: rgba(2, 6, 23, 0.72);
+            backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+            display: flex; align-items: center; justify-content: center; padding: 1rem;
+        }
+        .modal-panel {
+            width: 100%; max-width: 560px; max-height: 86vh; overflow-y: auto;
+            border-radius: 14px; padding: 1.5rem;
+        }
+        .stock-check-list {
+            margin: 0.75rem 0; border: 1px solid var(--border-subtle); border-radius: 10px;
+            max-height: 260px; overflow-y: auto;
+        }
+        .stock-check-item {
+            display: flex; align-items: center; gap: 0.6rem;
+            padding: 0.55rem 0.85rem; cursor: pointer; font-size: 0.85rem;
+            border-bottom: 1px solid rgba(71, 85, 105, 0.35); transition: background 0.15s;
+        }
+        .stock-check-item:last-child { border-bottom: none; }
+        .stock-check-item:hover { background: rgba(6, 182, 212, 0.08); }
+        .stock-check-item input { accent-color: #06b6d4; width: 15px; height: 15px; }
+        .stock-check-item em { font-style: normal; color: var(--text-muted); font-family: monospace; font-size: 0.75rem; }
+        .modal-input {
+            width: 100%; background: #0b1220; border: 1px solid var(--border-subtle);
+            border-radius: 8px; padding: 0.6rem 0.75rem; color: var(--text-primary);
+            font-size: 0.8rem; font-family: monospace; outline: none;
+        }
+        .modal-input:focus { border-color: var(--accent-cyan); }
+        .job-status-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.78rem; padding: 0.3rem 0; }
+        .job-status-row .mono { font-family: monospace; color: var(--text-muted); }
 
         @keyframes slideIn {
             from { transform: translateX(110%); opacity: 0; }
@@ -473,10 +511,17 @@ HTML_TEMPLATE = """
                     <h2 class="text-lg md:text-xl font-bold text-slate-100">扫描结果</h2>
                     <span class="strategy-badge" :class="strategyBadgeClass">[[ strategyLabel ]]</span>
                 </div>
-                <button @click="copyResults"
-                    class="text-xs px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 transition-colors flex items-center gap-1.5">
-                    📋 复制结果
-                </button>
+                <div class="flex items-center gap-2">
+                    <button @click="openReportModal" :disabled="results.length === 0"
+                        :class="results.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:bg-cyan-500/20'"
+                        class="text-xs px-3 py-1.5 rounded-md bg-cyan-500/10 border border-cyan-500/40 text-cyan-300 transition-colors flex items-center gap-1.5">
+                        📊 生成财务报告
+                    </button>
+                    <button @click="copyResults"
+                        class="text-xs px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 transition-colors flex items-center gap-1.5">
+                        📋 复制结果
+                    </button>
+                </div>
             </div>
             <div class="overflow-x-auto">
                 <table class="result-table">
@@ -531,6 +576,67 @@ HTML_TEMPLATE = """
             </div>
         </section>
 
+        <!-- 财务报告弹窗 -->
+        <div v-if="reportModal.show" class="modal-mask" @click.self="closeReportModal">
+            <div class="modal-panel glass-card">
+                <div class="flex items-center justify-between mb-1">
+                    <h3 class="text-base font-bold text-slate-100">📊 生成财务报告</h3>
+                    <button @click="closeReportModal" class="text-slate-400 hover:text-slate-200 text-lg leading-none">×</button>
+                </div>
+                <p class="text-xs text-slate-400">勾选需要分析的股票（每只约 5 分钟 / 10 万 tokens，3 路并发生成，单次最多 20 只）</p>
+
+                <div class="flex gap-2 mt-3">
+                    <button @click="selectPassedOnly" class="text-xs px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300">全选非观望</button>
+                    <button @click="selectedCodes = []" class="text-xs px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300">清空</button>
+                    <span class="ml-auto text-xs text-slate-400 self-center">已选 [[ selectedCodes.length ]] 只</span>
+                </div>
+
+                <div class="stock-check-list">
+                    <label v-for="s in sortedResults" :key="s.code" class="stock-check-item">
+                        <input type="checkbox" :value="s.code" v-model="selectedCodes" :disabled="reportJobRunning">
+                        <span class="flex-1">[[ s.name ]] <em>[[ s.code ]]</em></span>
+                        <span v-if="!s.is_rejected" class="status-pill status-pass">✅ 伏击圈</span>
+                        <span v-else class="status-pill status-watch">🟡 观望</span>
+                    </label>
+                </div>
+
+                <label class="block text-xs text-slate-400 mb-1">报告保存位置</label>
+                <div class="flex items-center gap-2">
+                    <div class="modal-input flex-1 truncate" :class="reportSaveDir ? '' : 'text-slate-500'">
+                        [[ reportSaveDir || '默认 ~/Documents/财经/当天日期文件夹' ]]
+                    </div>
+                    <button @click="pickReportDir" :disabled="reportJobRunning || pickingDir"
+                        class="shrink-0 text-xs px-3 py-2 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 transition-colors flex items-center gap-1">
+                        📁 [[ pickingDir ? '选择中...' : '选择文件夹' ]]
+                    </button>
+                </div>
+
+                <!-- 任务进度 -->
+                <div v-if="reportJob" class="mt-3 pt-3 border-t border-slate-700/50">
+                    <div class="text-xs text-slate-400 mb-1">任务进度（[[ reportJob.statusText ]]）</div>
+                    <div v-for="(r, code) in reportJob.results" :key="code" class="job-status-row">
+                        <span v-if="r.status === 'done'">✅</span>
+                        <span v-else-if="r.status === 'running'">⏳</span>
+                        <span v-else-if="r.status === 'failed'">❌</span>
+                        <span v-else>🕐</span>
+                        <span class="mono">[[ code ]]</span>
+                        <span class="text-slate-300">[[ r.name || '' ]]</span>
+                        <span v-if="r.docx" class="text-cyan-300 truncate">→ [[ r.docx ]]</span>
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-2 mt-4">
+                    <button @click="closeReportModal" class="text-xs px-4 py-2 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200">关闭</button>
+                    <button @click="submitReportJob"
+                        :disabled="selectedCodes.length === 0 || selectedCodes.length > 20 || reportJobRunning"
+                        :class="(selectedCodes.length === 0 || selectedCodes.length > 20 || reportJobRunning) ? 'opacity-40 cursor-not-allowed' : 'hover:bg-cyan-500/30'"
+                        class="text-xs px-4 py-2 rounded-md bg-cyan-500/20 border border-cyan-500/50 text-cyan-200 font-medium">
+                        [[ reportJobRunning ? '生成中...' : '生成 ' + selectedCodes.length + ' 只报告' ]]
+                    </button>
+                </div>
+            </div>
+        </div>
+
         <!-- Toast -->
         <transition>
             <div v-if="toast.show" class="toast" :class="'toast-' + toast.type">
@@ -556,10 +662,20 @@ HTML_TEMPLATE = """
                     scanType: 'manual',
                     currentStrategy: 'manual', // 精准记录当前的业务策略状态（manual代表回踩，rebound代表企稳）
                     toast: { show: false, message: '', type: 'error' },
-                    toastTimer: null
+                    toastTimer: null,
+                    // ===== 财务报告 =====
+                    reportModal: { show: false },
+                    selectedCodes: [],
+                    reportSaveDir: '',
+                    reportJob: null,        // { id, status, statusText, results: {code: {status, name, docx}} }
+                    reportJobTimer: null,
+                    pickingDir: false
                 }
             },
             computed: {
+                reportJobRunning() {
+                    return !!(this.reportJob && (this.reportJob.status === 'pending' || this.reportJob.status === 'running'));
+                },
                 passedCount() {
                     return this.results.filter(r => !r.is_rejected).length;
                 },
@@ -627,6 +743,95 @@ HTML_TEMPLATE = """
                 fillHotStocks() {
                     this.stockCodes = 'sh600023,sz000027,sz000899,sh605020,sh600900,sz000001,sh601318';
                     this.showToast('已填入自选股观察池', 'info');
+                },
+                // ===== 财务报告 =====
+                async openReportModal() {
+                    if (this.results.length === 0) return;
+                    this.selectPassedOnly();
+                    this.reportJob = null;
+                    this.reportModal.show = true;
+                    // 若后台仍有进行中的任务（如页面刷新后），恢复进度显示并继续轮询
+                    try {
+                        const resp = await fetch('/api/report_jobs_latest');
+                        const data = await resp.json();
+                        if (data && data.success && data.job &&
+                            (data.job.status === 'pending' || data.job.status === 'running')) {
+                            this.reportJob = data.job;
+                            this.startReportPolling();
+                        }
+                    } catch (e) { /* 忽略，按无任务处理 */ }
+                },
+                closeReportModal() {
+                    if (this.reportJobRunning) {
+                        this.showToast('任务仍在后台生成中，可稍后重新打开查看', 'info');
+                    }
+                    this.reportModal.show = false;
+                },
+                selectPassedOnly() {
+                    this.selectedCodes = this.results.filter(r => !r.is_rejected).map(r => r.code);
+                },
+                async pickReportDir() {
+                    if (this.pickingDir) return;
+                    this.pickingDir = true;
+                    try {
+                        const resp = await fetch('/api/pick_dir');
+                        const data = await resp.json();
+                        if (data && data.success) {
+                            this.reportSaveDir = data.path;
+                        } else if (data && data.error !== 'canceled') {
+                            this.showToast('选择文件夹失败: ' + data.error, 'error');
+                        }
+                    } catch (e) {
+                        this.showToast('选择文件夹失败: ' + e.message, 'error');
+                    } finally {
+                        this.pickingDir = false;
+                    }
+                },
+                async submitReportJob() {
+                    if (this.selectedCodes.length === 0 || this.selectedCodes.length > 20 || this.reportJobRunning) return;
+                    const stocks = this.selectedCodes.map(code => {
+                        const hit = this.results.find(r => r.code === code);
+                        return { code, name: hit ? hit.name : '' };
+                    });
+                    try {
+                        const resp = await fetch('/api/report_jobs', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ stocks, save_dir: this.reportSaveDir.trim() })
+                        });
+                        const data = await resp.json();
+                        if (data && data.success) {
+                            this.reportJob = data.job;
+                            this.showToast('任务已创建，后台开始生成报告', 'success');
+                            this.startReportPolling();
+                        } else {
+                            this.showToast((data && data.error) || '任务创建失败', 'error');
+                        }
+                    } catch (e) {
+                        this.showToast('请求失败: ' + e.message, 'error');
+                    }
+                },
+                startReportPolling() {
+                    if (this.reportJobTimer) clearInterval(this.reportJobTimer);
+                    this.reportJobTimer = setInterval(this.pollReportJob, 15000);
+                    this.pollReportJob();
+                },
+                async pollReportJob() {
+                    if (!this.reportJob) return;
+                    try {
+                        const resp = await fetch('/api/report_jobs/' + this.reportJob.id);
+                        const data = await resp.json();
+                        if (data && data.success) {
+                            const prevRunning = this.reportJobRunning;
+                            this.reportJob = data.job;
+                            if (prevRunning && !this.reportJobRunning) {
+                                clearInterval(this.reportJobTimer);
+                                this.reportJobTimer = null;
+                                const okCount = Object.values(this.reportJob.results).filter(r => r.status === 'done').length;
+                                this.showToast(`财务报告生成完毕：成功 ${okCount} / ${Object.keys(this.reportJob.results).length} 只`, okCount > 0 ? 'success' : 'error');
+                            }
+                        }
+                    } catch (e) { /* 轮询失败静默，下一轮重试 */ }
                 },
                 // ==========================================
                 // 核心修正 1：手动扫描不再强制重置策略，而是沿用当前的 currentStrategy
@@ -1351,5 +1556,183 @@ def scan_rebound():
     return jsonify({"status": "success", "results": passed_results, "total_scanned": len(stocks)})
 
 
+# ============================================================
+# 财务报告生成（通过 traecli exec 驱动 AI agent，逐只生成 docx）
+# ============================================================
+REPORT_JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'report_jobs')
+os.makedirs(REPORT_JOBS_DIR, exist_ok=True)
+REPORT_WORKDIR = '/Users/bytedance/Documents/财经'
+REPORT_SKILL_PATH = '/Users/bytedance/.trae-cn/skills/stock-finance-analysis/SKILL.md'
+
+
+def _report_job_path(job_id):
+    return os.path.join(REPORT_JOBS_DIR, f'{job_id}.json')
+
+
+def _save_report_job(job):
+    with open(_report_job_path(job['id']), 'w', encoding='utf-8') as f:
+        json.dump(job, f, ensure_ascii=False, indent=2)
+
+
+def _build_report_prompt(stock, save_dir):
+    """组装给 traecli agent 的自包含 prompt（冒烟测试验证版本）"""
+    code = stock['code'].lower()          # 形如 sh601098
+    sec = f"{code[2:]}.{ 'SH' if code.startswith('sh') else 'SZ' }"
+    name = stock.get('name') or code
+    return (
+        f"为A股 {name}({sec}) 生成财务分析报告 Word 文档。要求："
+        f"1) 先 Read {REPORT_SKILL_PATH}，严格遵循其输出模板章节结构与投资决策三维判别框架（5条红线/4项健康特征/击球区）。"
+        f"2) 本环境无 datapro/tdx MCP，数据一律用公开 HTTP 接口获取："
+        f"K线用 https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,60,qfq ；"
+        f"现价用 http://qt.gtimg.cn/q={code} （字段[3]现价[4]昨收）；"
+        f"财务指标/三大报表/杜邦/盈利/偿债/营运/成长用东财 "
+        f"https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_F10_FINANCE_MAINFINADATA"
+        f"&filter=(SECUCODE=\"{sec}\")&sortColumns=REPORT_DATE&sortTypes=-1&pageSize=4"
+        f"（自行探索该域名其他 reportName 接口补齐维度）；业绩预告/每股指标同理用东财 F10 接口。"
+        f"3) 数据缺失字段填 —，不得编造。"
+        f"4) 组装 JSON 后执行 python3 gen_stock_doc.py --outdir=\"{save_dir}\" <临时JSON>，"
+        f"临时 JSON 以 .tmp_ 开头且生成成功后删除。"
+        f"5) 最后只输出：最终结论（坚决剔除/保留入池）+ 一句依据 + docx 保存路径。"
+    )
+
+
+def _run_report_job(job_id):
+    """后台线程：3 路并发调用 traecli exec 生成报告，实时更新任务 JSON"""
+    path = _report_job_path(job_id)
+    with open(path, encoding='utf-8') as f:
+        job = json.load(f)
+    job['status'] = 'running'
+    _save_report_job(job)
+    lock = threading.Lock()
+
+    def worker(s):
+        code = s['code']
+        with lock:
+            job['results'][code] = {'status': 'running', 'name': s.get('name', '')}
+            _save_report_job(job)
+        try:
+            proc = subprocess.run(
+                ['traecli', 'exec', '--skip-git-repo-check', '--ephemeral',
+                 _build_report_prompt(s, job['save_dir'])],
+                cwd=REPORT_WORKDIR, capture_output=True, text=True, timeout=1800
+            )
+            out = (proc.stdout or '') + (proc.stderr or '')
+            m = re.findall(r'(/\S+?\.docx)', out)
+            docx = m[-1] if m else ''
+            ok = proc.returncode == 0 and bool(docx)
+            result = {
+                'status': 'done' if ok else 'failed',
+                'name': s.get('name', ''),
+                'docx': docx,
+                'output_tail': out[-800:]
+            }
+        except Exception as e:
+            result = {'status': 'failed', 'name': s.get('name', ''), 'error': str(e)}
+        with lock:
+            job['results'][code] = result
+            _save_report_job(job)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        list(ex.map(worker, job['stocks']))
+
+    results = job['results'].values()
+    done_n = sum(1 for r in results if r['status'] == 'done')
+    job['status'] = 'done' if done_n == len(job['stocks']) else ('partial' if done_n > 0 else 'failed')
+    _save_report_job(job)
+
+
+def _job_status_text(job):
+    mapping = {'pending': '排队中', 'running': '生成中', 'done': '全部完成',
+               'partial': '部分成功', 'failed': '全部失败'}
+    return mapping.get(job.get('status'), job.get('status', ''))
+
+
+@app.route('/api/pick_dir')
+def pick_dir():
+    """调起 macOS 原生文件夹选择框，返回所选绝对路径"""
+    try:
+        proc = subprocess.run(
+            ['osascript', '-e',
+             'POSIX path of (choose folder with prompt "选择财务报告保存位置")'],
+            capture_output=True, text=True, timeout=120
+        )
+        if proc.returncode != 0:
+            # 用户点了取消
+            return jsonify({"success": False, "error": "canceled"})
+        path = proc.stdout.strip().rstrip('/')
+        if not path:
+            return jsonify({"success": False, "error": "canceled"})
+        return jsonify({"success": True, "path": path})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/report_jobs', methods=['POST'])
+def create_report_job():
+    data = request.json or {}
+    stocks = data.get('stocks', [])
+    save_dir = (data.get('save_dir') or '').strip()
+
+    if not stocks:
+        return jsonify({"success": False, "error": "未选择任何股票"}), 400
+    if len(stocks) > 20:
+        return jsonify({"success": False, "error": "单次最多 20 只（每只约 10 万 tokens）"}), 400
+    for s in stocks:
+        if not re.match(r'^(sh|sz)\d{6}$', str(s.get('code', '')).lower()):
+            return jsonify({"success": False, "error": f"非法股票代码: {s.get('code')}"}), 400
+
+    if not save_dir:
+        save_dir = os.path.join(REPORT_WORKDIR, datetime.now().strftime('%m.%d').lstrip('0').replace('.0', '.'))
+    save_dir = os.path.abspath(os.path.expanduser(save_dir))
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"保存目录不可用: {e}"}), 400
+
+    job_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    job = {
+        'id': job_id,
+        'status': 'pending',
+        'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'save_dir': save_dir,
+        'stocks': [{'code': s['code'].lower(), 'name': s.get('name', '')} for s in stocks],
+        'results': {s['code'].lower(): {'status': 'pending', 'name': s.get('name', '')} for s in stocks}
+    }
+    _save_report_job(job)
+    threading.Thread(target=_run_report_job, args=(job_id,), daemon=True).start()
+
+    resp = dict(job)
+    resp['statusText'] = _job_status_text(job)
+    return jsonify({"success": True, "job": resp})
+
+
+@app.route('/api/report_jobs/<job_id>')
+def get_report_job(job_id):
+    if not re.match(r'^\d{8}_\d{6}$', job_id):
+        return jsonify({"success": False, "error": "非法任务ID"}), 400
+    path = _report_job_path(job_id)
+    if not os.path.exists(path):
+        return jsonify({"success": False, "error": "任务不存在"}), 404
+    with open(path, encoding='utf-8') as f:
+        job = json.load(f)
+    job['statusText'] = _job_status_text(job)
+    return jsonify({"success": True, "job": job})
+
+
+@app.route('/api/report_jobs_latest')
+def get_latest_report_job():
+    """返回最近一次任务（用于页面刷新后恢复进度显示）"""
+    if not os.path.isdir(REPORT_JOBS_DIR):
+        return jsonify({"success": True, "job": None})
+    files = sorted(f for f in os.listdir(REPORT_JOBS_DIR) if f.endswith('.json'))
+    if not files:
+        return jsonify({"success": True, "job": None})
+    with open(os.path.join(REPORT_JOBS_DIR, files[-1]), encoding='utf-8') as f:
+        job = json.load(f)
+    job['statusText'] = _job_status_text(job)
+    return jsonify({"success": True, "job": job})
+
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    # 常驻模式（launchd）下 STOCK_DEBUG=0 关闭调试器；手动终端运行默认开 debug 方便开发
+    app.run(host='0.0.0.0', port=5001, debug=os.environ.get('STOCK_DEBUG', '1') == '1')
